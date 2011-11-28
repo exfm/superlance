@@ -76,6 +76,18 @@ import xmlrpclib
 import boto
 import socket
 from datetime import datetime
+import psutil
+
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+hdlr = logging.FileHandler('/home/lucas/exfm/superlance/memmon.log')
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+hdlr.setFormatter(formatter)
+
+log = logging.getLogger(__name__)
+log.addHandler(hdlr) 
+
 
 from supervisor import childutils
 from supervisor.datatypes import byte_size
@@ -104,13 +116,36 @@ class Memmon:
         self.aws_secret_key = aws_secret_key
         self._hostname = socket.gethostname()
 
-    
-    def _log_usage(self, name, value):
+        self.cloudwatch = None
         if self.aws_access_key and self.aws_secret_key:
-            conn = boto.connect_cloudwatch(self.aws_access_key, self.aws_access_key)
-            conn.put_metric_data('App', "%s:%s" % (self._hostname, name), value=value, 
-                timestamp=datetime.utcnow(), unit='Kilobytes')
-        
+            self.cloudwatch = boto.connect_cloudwatch(self.aws_access_key, self.aws_secret_key)
+
+
+    
+    def _log_usage(self, name, memory, cpu_percent):
+        if self.cloudwatch:
+            self.cloudwatch.put_metric_data('App', "Memory Usage: %s" % name, value=memory, 
+                timestamp=datetime.utcnow(), unit='Kilobytes', 
+                dimensions={'Host': self._hostname})
+            
+            self.cloudwatch.put_metric_data('App', "CPU Usage: %s" % name, value=cpu_percent, 
+                timestamp=datetime.utcnow(), unit='Percent', 
+                dimensions={'Host': self._hostname})
+    
+    def _log_restart(self, name):
+        if self.cloudwatch:
+            self.cloudwatch.put_metric_data('App', "Restart %s" % name, 
+                value=1, 
+                timestamp=datetime.utcnow(), unit='Count', 
+                dimensions={'Host': self._hostname})
+    
+    def _log_machine_state(self):
+        if self.cloudwatch:
+            usage = psutil.phymem_usage()
+            self.cloudwatch.put_metric_data('App', "Memory Usage", 
+                value=usage.percent, 
+                timestamp=datetime.utcnow(), unit='Percent', 
+                dimensions={'Host': self._hostname})
 
     def runforever(self, test=False):
         while 1:
@@ -121,10 +156,12 @@ class Memmon:
             if not headers['eventname'].startswith('TICK'):
                 # do nothing with non-TICK events
                 childutils.listener.ok(self.stdout)
+                log.debug('Got tick event')
                 if test:
                     break
                 continue
 
+            
             status = []
             if self.programs:
                 status.append(
@@ -155,31 +192,25 @@ class Memmon:
                     # in standby mode, non-auto-started).
                     continue
 
-                data = shell(self.pscommand % pid)
-                if not data:
-                    # no such pid (deal with race conditions)
-                    continue
-
-                try:
-                    rss = data.lstrip().rstrip()
-                    rss = int(rss) * 1024 # rss is in KB
-                except ValueError:
-                    # line doesn't contain any data, or rss cant be intified
-                    continue
+                p = psutil.Process(pid)
+                rss = int(p.get_memory_info().rss)
+                percent_cpu = p.get_cpu_percent()
 
                 for n in name, pname:
                     if n in self.programs:
                         self.stderr.write('RSS of %s is %s\n' % (pname, rss))
-                        self._log_usage(pname, rss)
+                        self._log_usage(pname, rss, percent_cpu)
 
                         if  rss > self.programs[name]:
                             self.restart(pname, rss)
+                            self._log_restart(pname)
                             continue
 
                 if group in self.groups:
                     self.stderr.write('RSS of %s is %s\n' % (pname, rss))
                     if rss > self.groups[group]:
                         self.restart(pname, rss)
+                        self._log_restart(pname)
                         continue
 
                 if self.any is not None:
@@ -187,7 +218,10 @@ class Memmon:
 
                     if rss > self.any:
                         self.restart(pname, rss)
+                        self._log_restart(pname)
                         continue
+            
+            self._log_machine_state()
 
             self.stderr.flush()
             childutils.listener.ok(self.stdout)
@@ -316,8 +350,11 @@ def main():
         
         if option in ('-c', '--aws_secret_key'):
             aws_secret_key = value
-        
-
+    
+    log.debug('Starting memmon')
+    log.debug('aws_access_key:%s' % (aws_access_key))
+    log.debug('aws_secret_key:%s' % (aws_secret_key))
+    
     rpc = childutils.getRPCInterface(os.environ)
     memmon = Memmon(programs, groups, any, sendmail, email, rpc, aws_access_key, aws_secret_key)
     memmon.runforever()
