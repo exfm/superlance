@@ -52,6 +52,11 @@ Options:
       address when any process is restarted.  If no email address is
       specified, email will not be sent.
 
+-k -- amazon cloudwatch access key
+
+-c -- amazon cloudwatch secret key
+
+
 The -p and -g options may be specified more than once, allowing for
 specification of multiple groups and processes.
 
@@ -68,6 +73,9 @@ import os
 import sys
 import time
 import xmlrpclib
+import boto
+import socket
+from datetime import datetime
 
 from supervisor import childutils
 from supervisor.datatypes import byte_size
@@ -80,7 +88,7 @@ def shell(cmd):
     return os.popen(cmd).read()
 
 class Memmon:
-    def __init__(self, programs, groups, any, sendmail, email, rpc):
+    def __init__(self, programs, groups, any, sendmail, email, rpc, aws_access_key, aws_secret_key):
         self.programs = programs
         self.groups = groups
         self.any = any
@@ -92,6 +100,17 @@ class Memmon:
         self.stderr = sys.stderr
         self.pscommand = 'ps -orss= -p %s'
         self.mailed = False # for unit tests
+        self.aws_access_key = aws_access_key
+        self.aws_secret_key = aws_secret_key
+        self._hostname = socket.gethostname()
+
+    
+    def _log_usage(self, name, value):
+        if self.aws_access_key and self.aws_secret_key:
+            conn = boto.connect_cloudwatch(self.aws_access_key, self.aws_access_key)
+            conn.put_metric_data('App', "%s:%s" % (self._hostname, name), value=value, 
+                timestamp=datetime.utcnow(), unit='Kilobytes')
+        
 
     def runforever(self, test=False):
         while 1:
@@ -151,6 +170,8 @@ class Memmon:
                 for n in name, pname:
                     if n in self.programs:
                         self.stderr.write('RSS of %s is %s\n' % (pname, rss))
+                        self._log_usage(pname, rss)
+
                         if  rss > self.programs[name]:
                             self.restart(pname, rss)
                             continue
@@ -163,6 +184,7 @@ class Memmon:
 
                 if self.any is not None:
                     self.stderr.write('RSS of %s is %s\n' % (pname, rss))
+
                     if rss > self.any:
                         self.restart(pname, rss)
                         continue
@@ -237,7 +259,7 @@ def parse_size(option, value):
 
 def main():
     import getopt
-    short_args="hp:g:a:s:m:"
+    short_args="hp:g:a:s:m:k:c:"
     long_args=[
         "help",
         "program=",
@@ -245,6 +267,9 @@ def main():
         "any=",
         "sendmail_program=",
         "email=",
+        "aws_access_key=",
+        "aws_secret_key=",
+        "env_prefix="
         ]
     arguments = sys.argv[1:]
     if not arguments:
@@ -260,6 +285,8 @@ def main():
     any = None
     sendmail = '/usr/sbin/sendmail -t -i'
     email = None
+    aws_access_key = None
+    aws_secret_key = None
 
     for option, value in opts:
 
@@ -283,9 +310,16 @@ def main():
 
         if option in ('-m', '--email'):
             email = value
+        
+        if option in ('-k', '--aws_access_key'):
+            aws_access_key = value
+        
+        if option in ('-c', '--aws_secret_key'):
+            aws_secret_key = value
+        
 
     rpc = childutils.getRPCInterface(os.environ)
-    memmon = Memmon(programs, groups, any, sendmail, email, rpc)
+    memmon = Memmon(programs, groups, any, sendmail, email, rpc, aws_access_key, aws_secret_key)
     memmon.runforever()
 
 if __name__ == '__main__':
